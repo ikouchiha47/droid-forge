@@ -1,0 +1,57 @@
+name: Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to release (e.g. app/img-to-pdf)'
+        required: true
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+
+      # Re-build from the branch at release time (clean, reproducible)
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('android/**/*.gradle*', 'android/gradle/libs.versions.toml') }}
+          restore-keys: ${{ runner.os }}-gradle-
+
+      - name: Install Android SDK components
+        run: |
+          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-36" \
+            "build-tools;36.0.0" | grep -v "^\[=" || true
+
+      - name: Run unit tests
+        run: cd android && ./gradlew testDebugUnitTest --console=plain
+
+      - name: Build release APK
+        run: cd android && ./gradlew assembleRelease --console=plain
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.branch }}-${{ inputs.tag }}
+          name: "${{ inputs.branch }} ${{ inputs.tag }}"
+          files: android/app/build/outputs/apk/release/app-release.apk
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
