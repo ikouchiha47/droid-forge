@@ -1,6 +1,6 @@
 # droid-forge — Architecture Plan
 
-Living design document. Update as decisions are made.
+Living design document. Decisions made in conversation are marked **DECIDED**.
 
 ---
 
@@ -16,688 +16,727 @@ boilerplate twice.
 
 ---
 
-## 1. Stack Decision
+## 1. Stack
 
-**Pure Kotlin + Jetpack Compose. No React Native.**
+**DECIDED: Pure Kotlin + Jetpack Compose. No React Native.**
 
 | Concern | Pure Kotlin | React Native |
 |---|---|---|
 | CI build time | ~3-4 min | ~10-15 min (npm + bundler + Gradle) |
 | APK size | ~4-6 MB | ~25-40 MB |
-| Platform API access | Direct — no bridge | Needs NativeModule for anything below JS |
-| opencode quality | Good (Compose well-represented) | Very good (TSX excellent) |
-| Networking (BLE/TLS/mDNS) | Native Kotlin, no bridge needed | Already in Kotlin anyway (see wristturn-app) |
+| Platform API access | Direct | Needs NativeModule bridge |
+| Networking (BLE/TLS/mDNS) | Native, no bridge | Already Kotlin anyway |
 
-The wristturn-app and CodeKeyboard both show that all the hard platform work is Kotlin regardless of
-the UI layer. The RN bridge adds overhead without adding capability for utility and networking apps.
+**Gradle**: Groovy `.gradle` + `gradle/libs.versions.toml`. Not Kotlin DSL — AI training data for
+Groovy is much larger.
 
-**Gradle**: Groovy `.gradle` files + `gradle/libs.versions.toml` for deps. Not Kotlin DSL — AI
-training data for Groovy Gradle is much larger and more reliable.
+**Min SDK**: 26 (Android 8.0, ~95% of devices).
 
-**Min SDK**: 26 (Android 8.0, ~95% of devices). Unlocks: `NsdManager` stability, `JobScheduler`,
-proper foreground service APIs, `AudioFocusRequest`.
+**ABI targets**: `arm64-v8a,armeabi-v7a` only. `x86`/`x86_64` are emulator-only — excluding them
+halves APK size for FFmpeg/AI apps.
 
 ---
 
-## 2. Skeleton Structure
+## 2. Design Principles
+
+Every interface and class in the skeleton follows these rules. Opencode inherits them by example.
+
+### Interface Segregation
+
+No fat interfaces. Each interface does one thing. A transport doesn't know about crypto. A crypto
+layer doesn't know about transports. A discovery mechanism doesn't know about connections.
+
+```
+IDiscovery      — find peers
+ISignaling      — exchange connection offers  
+ITransport      — send/receive bytes
+IFraming        — encode/decode message boundaries
+ICipher         — encrypt/decrypt a frame
+IIdentity       — persist and load key material
+```
+
+A P2P chat app composes: `NsdDiscovery + NostrSignaling + WebRtcTransport + NoiseFraming + AesCipher`
+A LAN tracker composes:  `NsdDiscovery + DirectTcpTransport + LengthPrefixFraming + AesCipher`
+A co-watch app composes: `NostrSignaling + WebRtcTransport + NoopCipher` (WebRTC encrypts itself)
+
+No component knows about the others.
+
+### Liskov Substitution
+
+Every implementation of an interface must be substitutable without changing caller behaviour.
+Concretely: `NsdDiscovery` and `NostrSignaling` both implement `ISignaling` (for the signaling
+phase of a WebRTC handshake). Swapping one for the other changes nothing in the connection
+establishment code.
+
+This means: no implementation may add preconditions (e.g. "must call init() first") that the
+interface doesn't declare, and no implementation may return values the interface doesn't promise.
+Lifecycle methods (`connect`, `disconnect`) are declared on the interface so all implementations
+honour the same contract.
+
+### Open/Closed
+
+The skeleton's components are open for extension, closed for modification.
+
+- Adding a new transport (QUIC, BLE) = implement `ITransport`, wire it in. No changes to existing code.
+- Adding a new cipher (ChaCha20, Double Ratchet) = implement `ICipher`. Framing and transport unchanged.
+- Adding a new discovery mechanism (Bluetooth LE scan, DHT) = implement `IDiscovery`. Unchanged callers.
+
+The `P2PSession` class (Section 5) is the composition root. It takes `IDiscovery`, `ISignaling`,
+`ITransport`, `IFraming`, `ICipher` as constructor parameters. None of these know about each other.
+
+### Composition over Inheritance
+
+`NetworkService` (foreground service base) is **not** a class to extend. It is a lifecycle manager
+that takes a `ServiceWorker` (functional interface) as a dependency:
+
+```kotlin
+// BAD — inheritance
+class MyBleService : NetworkService() { ... }  // couples to base class internals
+
+// GOOD — composition
+val service = NetworkService(worker = BleWorker(bleHelper))
+```
+
+`BaseViewModel` follows the same pattern — it holds an `AppState` flow and exposes emit/collect.
+It does not know what state looks like. The concrete ViewModel holds the business logic and calls
+`emit()` on the shared state machine.
+
+---
+
+## 3. Core Interfaces
+
+```kotlin
+// Discovery: find peers on local network or internet
+interface IDiscovery {
+    fun start()
+    fun stop()
+    val peers: Flow<PeerInfo>  // emits as peers appear/disappear
+}
+
+// Signaling: exchange WebRTC SDP offers and ICE candidates
+// Used only for WebRTC setup — not needed for direct TCP
+interface ISignaling {
+    suspend fun publish(peerId: String, offer: SignalEnvelope)
+    fun incoming(peerId: String): Flow<SignalEnvelope>
+    suspend fun close()
+}
+
+// Transport: raw byte I/O, no framing, no crypto
+interface ITransport {
+    suspend fun connect(peer: PeerInfo)
+    suspend fun disconnect()
+    suspend fun send(bytes: ByteArray)
+    val incoming: Flow<ByteArray>
+    val isConnected: StateFlow<Boolean>
+}
+
+// Framing: message boundary encoding (length-prefix, delimiter, etc.)
+interface IFraming {
+    fun encode(payload: ByteArray): ByteArray
+    fun decode(stream: Flow<ByteArray>): Flow<ByteArray>
+}
+
+// Cipher: encrypt/decrypt one message at a time
+// Stateless (AES-GCM) or stateful (Noise, Double Ratchet) — both fit here
+interface ICipher {
+    fun encrypt(plaintext: ByteArray): ByteArray
+    fun decrypt(ciphertext: ByteArray): ByteArray
+}
+
+// Identity: load and persist key material
+interface IIdentity {
+    fun publicKey(): ByteArray
+    fun sign(data: ByteArray): ByteArray
+    fun verify(data: ByteArray, sig: ByteArray, theirPublicKey: ByteArray): Boolean
+}
+```
+
+Implementations in the skeleton:
+
+| Interface | Implementations |
+|---|---|
+| `IDiscovery` | `NsdDiscovery` (mDNS/LAN), `NostrDiscovery` (internet) |
+| `ISignaling` | `NostrSignaling`, `DirectSignaling` (QR/clipboard for offline exchange) |
+| `ITransport` | `TcpTransport`, `WebRtcTransport`, `WebSocketTransport` |
+| `IFraming` | `LengthPrefixFraming` (4-byte big-endian length header) |
+| `ICipher` | `AesGcmCipher` (stateless), `NoiseCipher` (stateful handshake), `NoopCipher` |
+| `IIdentity` | `Ed25519Identity` (file-backed) |
+
+---
+
+## 4. Skeleton File Structure
 
 ```
 skeleton/
   scripts/
     rename-package.sh         # sed across manifest + build.gradle + all .kt files
-    gen-icon.sh               # SVG → adaptive icon density buckets (requires Inkscape or rsvg)
+    gen-icon.sh               # SVG → adaptive icon density buckets
   android/
     gradle/libs.versions.toml
     app/
-      build.gradle            # abiFilters: arm64-v8a,armeabi-v7a (not x86 — emulator-only)
-      proguard-rules.pro      # baseline + sections for each optional dep
+      build.gradle            # abiFilters: arm64-v8a,armeabi-v7a
+      proguard-rules.pro
       src/main/
         AndroidManifest.xml   # permissions commented, FileProvider wired, Share intents commented
         res/xml/file_paths.xml
+        assets/styles/
+          greyscale.json      # MapLibre greyscale/low-power style
         java/com/forge/skeleton/
-          App.kt              # Application subclass
+          App.kt
           MainActivity.kt
-          MainScreen.kt       # placeholder Composable
+          MainScreen.kt
           MainViewModel.kt
           ui/
             AppTheme.kt
-            AppScaffold.kt    # Scaffold + TopAppBar + LoadingOverlay
+            AppScaffold.kt
           base/
-            BaseViewModel.kt
             AppState.kt       # sealed class: Loading | Success<T> | Error
-            AppScope.kt       # application-level SupervisorJob CoroutineScope
+            AppScope.kt       # application SupervisorJob CoroutineScope
+            BaseViewModel.kt
           settings/
-            AppSettings.kt    # SharedPreferences singleton (proven pattern from CodeKeyboard)
+            AppSettings.kt
           permission/
             PermissionHelper.kt
           file/
-            UriHelper.kt      # copy content URI to processable File (SAF)
-            ShareHelper.kt    # ShareCompat wrapper, FileProvider-aware
+            UriHelper.kt
+            ShareHelper.kt
+            IntentHelper.kt   # ACTION_SEND / ACTION_SEND_MULTIPLE handler
           notification/
-            NotificationHelper.kt  # channel creation, required Android 8+
+            NotificationHelper.kt
           crash/
-            CrashLogger.kt    # write crash to file — no Play Store = no Firebase
+            CrashLogger.kt
           work/
-            BaseWorker.kt     # CoroutineWorker with StateFlow progress — for FFmpeg/AI
-          network/            # present, not wired into MainActivity by default
-            ITransport.kt
-            NsdHelper.kt      # mDNS via NsdManager (built-in, no deps)
-            TcpServer.kt      # coroutine-based, length-prefix framed
-            TcpClient.kt
-            NetworkService.kt # foreground service base — subclass for BLE/TCP/WebSocket
-            SecureChannel.kt  # TLS TOFU: RSA keygen, self-signed cert (BouncyCastle), persist identity
-            WebSocketTransport.kt
-          ble/
-            BLEHelper.kt      # scan→connect→GATT→notify lifecycle (from wristturn-app)
+            BaseWorker.kt     # CoroutineWorker + StateFlow progress
+          network/
+            model/
+              PeerInfo.kt
+              SignalEnvelope.kt
+            interfaces/
+              IDiscovery.kt
+              ISignaling.kt
+              ITransport.kt
+              IFraming.kt
+              ICipher.kt
+              IIdentity.kt
+            discovery/
+              NsdDiscovery.kt       # mDNS — NsdManager, LAN only
+              NostrDiscovery.kt     # Nostr relay — internet peer discovery
+            signaling/
+              NostrSignaling.kt     # SDP/ICE exchange via Nostr relay
+              DirectSignaling.kt    # QR / clipboard — fully offline
+            transport/
+              TcpTransport.kt
+              WebSocketTransport.kt
+              WebRtcTransport.kt    # wraps io.getstream:webrtc-android (optional dep)
+            framing/
+              LengthPrefixFraming.kt
+            session/
+              P2PSession.kt         # composition root: wires IDiscovery+ISignaling+ITransport+IFraming+ICipher
+              ServiceWorker.kt      # functional interface for NetworkService
+              NetworkService.kt     # foreground service, takes ServiceWorker by composition
           crypto/
-            CryptoHelper.kt   # AES-256-GCM, HKDF — Android JCE, zero deps
-            IdentityStore.kt  # persist/load RSA/EC key pairs to files
+            AesGcmCipher.kt         # implements ICipher, stateless AES-256-GCM
+            NoiseCipher.kt          # implements ICipher, Noise_XX stateful handshake
+            NoopCipher.kt           # implements ICipher, plaintext (WebRTC already encrypted)
+            Ed25519Identity.kt      # implements IIdentity, file-backed key pair
+          ble/
+            BLEHelper.kt
           maps/
-            MapLibreHelper.kt # MapLibre initialisation, offline region download
-            LocationHelper.kt # FusedLocationProvider wrapper with Flow
+            LocationHelper.kt       # FusedLocationProvider as Flow<Location>
   docs/
-    signal-ratchet.md         # THIS FILE — crypto protocol design
-    blockchain.md             # what is actually feasible on mobile
-    maps-realtime.md          # OSM, MapLibre, routing, GTFS-RT
-    protocols.md              # WebRTC, QUIC, MQTT, Matrix — when to use what
+    crypto.md                 # Signal/Noise/Double Ratchet explained
+    blockchain.md             # feasibility analysis
+    maps.md                   # OSM, MapLibre, routing, GTFS-RT
     co-watch.md               # synchronized video playback design
-    optional-deps.md          # FFmpeg, Signal, ONNX, Room — copy-paste blocks
-    ai-inference.md           # on-device model pattern (WorkManager + StateFlow)
-  SKELETON.md                 # opencode contract — what's pre-built, what to fill in
+    optional-deps.md          # FFmpeg, Signal, ONNX, Room, WebRTC — copy-paste blocks
+    ai-inference.md           # on-device model pattern
+  SKELETON.md
   .github/workflows/
-    build.yml                 # push to app/** → test + build + artifact
-    release.yml               # workflow_dispatch → publish GitHub Release
+    build.yml
+    release.yml
 ```
 
 ---
 
-## 3. Capability Tiers
+## 5. P2PSession — The Composition Root
 
-### Tier 1 — Core (always present, pre-built, tested)
+`P2PSession` is the only place where the interfaces are wired together. It knows about all of them.
+Nothing else does.
 
-Every app gets these. Opencode uses them, never rewrites them.
+```kotlin
+class P2PSession(
+    private val discovery: IDiscovery,
+    private val signaling: ISignaling,
+    private val transport: ITransport,
+    private val framing:   IFraming,
+    private val cipher:    ICipher,
+) {
+    val messages: Flow<ByteArray> = transport.incoming
+        .let { framing.decode(it) }
+        .map { cipher.decrypt(it) }
 
-- `AppSettings` — SharedPreferences singleton. Same pattern as CodeKeyboard's `KeyboardSettings`.
-- `PermissionHelper` — wraps `ActivityResultLauncher` correctly. This breaks when written ad-hoc.
-- `BaseViewModel<S>` + `AppState<T>` — enforced pattern. Every screen is `Loading | Success | Error`.
-- `UriHelper.copyToCache(ctx, uri)` — copy SAF content URI to processable File.
-- `ShareHelper.shareFile(ctx, file, mimeType)` — correct FileProvider-aware share.
-- `NotificationHelper` — channel creation boilerplate (Android 8+ requirement).
-- `CrashLogger` — `Thread.setDefaultUncaughtExceptionHandler` → writes crash log to file.
-- `AppScaffold` — Scaffold + TopAppBar + LoadingOverlay composable.
-- `BaseWorker` — `CoroutineWorker` with progress StateFlow for long operations (conversion, inference).
+    suspend fun send(payload: ByteArray) {
+        val encrypted = cipher.encrypt(payload)
+        val framed    = framing.encode(encrypted)
+        transport.send(framed)
+    }
 
-### Tier 2 — Network (in skeleton, not wired by default)
+    fun startDiscovery() = discovery.start()
 
-Drawn from wristturn-app patterns, ported to pure Kotlin.
+    suspend fun connectTo(peer: PeerInfo) = transport.connect(peer)
 
-- `NsdHelper` — `NsdManager` advertise + discover. Pure Android API, no deps. The register/unregister
-  lifecycle has subtle threading issues; pre-build it once correctly.
-- `TcpServer` / `TcpClient` — coroutine-based with length-prefix framing (same concept as
-  `frameMessage()` in wristturn-app's `AndroidTVRemoteClient`).
-- `NetworkService` — foreground service base class. Same structure as wristturn-app's
-  `BLEForegroundService` minus BLE specifics. Subclass for any long-running network operation.
-- `SecureChannel` — RSA keygen, self-signed X.509 via BouncyCastle (bundled with Android via
-  reflection, exactly as wristturn-app does it), persistent identity to files, TOFU trust model.
-- `WebSocketTransport` — OkHttp WebSocket wrapped in `ITransport` + `Flow<ByteArray>`.
-- `ITransport` — the `IDeviceAdapter` pattern from wristturn-app, generalised:
-  ```kotlin
-  interface ITransport {
-      suspend fun connect()
-      suspend fun disconnect()
-      suspend fun send(frame: ByteArray)
-      val incoming: Flow<ByteArray>
-      val isConnected: StateFlow<Boolean>
-  }
-  ```
-
-### Tier 3 — BLE (in skeleton, not wired by default)
-
-`BLEHelper` — scan → connect → `discoverServices` → `getCharacteristic` → CCCD write (enable
-notifications) → `onCharacteristicChanged`. Directly from wristturn-app's `BLEForegroundService`,
-stripped of wristturn-specific UUIDs. The CCCD write is the step everyone forgets.
-
-### Tier 4 — Maps (in skeleton, not wired by default)
-
-`MapLibreHelper` — MapLibre Android initialisation, offline region manager, style loading (including
-a pre-built greyscale/vector style for low-power mode).
-
-`LocationHelper` — `FusedLocationProviderClient` wrapped as `Flow<Location>` with permission check.
-
-### Tier 5 — Heavy optional deps (documented only, NOT in build.gradle)
-
-See `docs/optional-deps.md`. These have real costs and are app-specific.
-
-- **FFmpeg** (`ffmpeg-kit-android-min`): ~15 MB per ABI. Add only when needed.
-- **Signal Protocol** (`libsignal-client`): adds Signal's full X3DH + Double Ratchet.
-- **Noise Protocol** (`noise-java`): simpler alternative to Signal for synchronous P2P.
-- **ONNX Runtime** (`onnxruntime-android`): on-device AI inference.
-- **LiteRT/TFLite** (`tensorflow-lite`): smaller, faster inference for vision tasks.
-- **llama.cpp** (JNI): on-device LLM inference (Phi-3-mini, Gemma-2B).
-- **Room**: SQLite ORM, when SharedPreferences isn't enough.
-- **MapLibre Android SDK**: vector maps, offline-capable.
-- **web3j**: Ethereum wallet + contract interaction.
-
----
-
-## 4. Crypto — Signal Protocol & Double Ratchet
-
-### TODO: Discussion still in progress
-
-#### What forward secrecy actually means
-
-Compromise of a long-term private key does not reveal past session messages. Each message is
-encrypted with a key that is derived from an ephemeral key exchange and then discarded. The attacker
-who steals your key today cannot decrypt messages from last week.
-
-#### Double Ratchet algorithm (what Signal uses)
-
-Two interleaved ratchets:
-
-**Symmetric-key ratchet (KDF chain)**
-A chain key `CK` is fed through a KDF to produce a message key `MK` and the next chain key. The
-message key encrypts one message, then is discarded. Compromise of `CK[n]` reveals `MK[n]` and
-forward but not `MK[0..n-1]` (forward secrecy).
-
-```
-CK[0] → KDF → MK[0], CK[1]
-CK[1] → KDF → MK[1], CK[2]
-...
+    suspend fun close() {
+        discovery.stop()
+        transport.disconnect()
+        signaling.close()
+    }
+}
 ```
 
-**Diffie-Hellman ratchet (asymmetric)**
-On every message exchange, both parties generate a new DH key pair. The DH output seeds a new KDF
-chain, producing a new `CK`. This provides **break-in recovery**: even if an attacker compromises
-the current chain, the next DH ratchet step produces a new chain they cannot derive.
+### Example: LAN group tracker
 
-The combination: FS (past messages safe if current state compromised) + break-in recovery (future
-messages safe after compromise is detected and ratchet advances).
+```kotlin
+P2PSession(
+    discovery  = NsdDiscovery(context, serviceType = "_tracker._tcp"),
+    signaling  = DirectSignaling(),   // LAN — no signaling needed, connect directly
+    transport  = TcpTransport(),
+    framing    = LengthPrefixFraming(),
+    cipher     = AesGcmCipher(groupKey),
+)
+```
 
-#### X3DH — key agreement that bootstraps the Double Ratchet
+### Example: Internet P2P chat
 
-Allows Alice to send to Bob when Bob is **offline** (async messaging):
+```kotlin
+P2PSession(
+    discovery  = NostrDiscovery(relayUrl = "wss://relay.damus.io", topic = roomId),
+    signaling  = NostrSignaling(relayUrl = "wss://relay.damus.io"),
+    transport  = WebRtcTransport(stunServers = listOf("stun:stun.l.google.com:19302")),
+    framing    = LengthPrefixFraming(),
+    cipher     = NoiseCipher(identity),   // Noise_XX handshake over the DataChannel
+)
+```
 
-- Bob publishes to a server: identity key `IK_B`, signed prekey `SPK_B`, one-time prekeys `OPK_B`
-- Alice computes a shared secret from: `DH(IK_A, SPK_B)`, `DH(EK_A, IK_B)`, `DH(EK_A, SPK_B)`,
-  `DH(EK_A, OPK_B)` — combines 3-4 DH outputs via HKDF
-- Shared secret initialises the Double Ratchet
+### Example: Co-watch (WebRTC handles encryption)
 
-**The server requirement problem for P2P**: X3DH needs a prekey server so Bob's prekeys are
-available when he's offline. Options for P2P:
-1. **Skip X3DH, use synchronous DH**: both online → direct ephemeral key exchange. Simpler, loses
-   async capability.
-2. **Minimal prekey server**: a single HTTPS endpoint (could be a GitHub Gist, a static file, a
-   Cloudflare Worker) that holds Bob's signed prekeys. Bob rotates them periodically. Stateless.
-3. **IPFS for prekeys**: Bob publishes prekeys to IPFS, Alice fetches by CID. Fully decentralised.
-4. **Matrix as transport**: Matrix rooms handle key distribution natively via Olm/Megolm (which
-   is Signal's Double Ratchet). Self-host a Synapse or use element.io.
-
-#### Alternative: Noise Protocol (simpler, often sufficient)
-
-The Noise Protocol Framework defines composable handshake patterns. For synchronous P2P:
-
-**Noise_XX**: both parties authenticate their static keys during handshake, then communicate.
-- Both sides have long-term static keys
-- Ephemeral keys generated per-session → FS within a session
-- No prekey server needed
-- 3 messages to complete handshake
-
-**Noise_IK**: Alice knows Bob's static key in advance (retrieved out-of-band), faster (2 messages).
-
-For group chat: Noise establishes pairwise channels; you need a separate layer for group key
-agreement (e.g., MLS — Messaging Layer Security, RFC 9420, the IETF standard for group E2E).
-
-#### MLS (Messaging Layer Security) — group forward secrecy
-
-RFC 9420. Designed for groups. Each epoch has a group secret; adding/removing members or advancing
-the ratchet produces a new epoch with a new key. Past epochs are discarded. Library: `openmls`
-(Rust, no Android port yet). Realistically: for group chat you either use Signal's sender-key
-protocol (pairwise session → encrypt-once with sender key, distribute sender key to group) or wait
-for MLS libraries to mature.
-
-#### Decision to make
-
-- **Synchronous P2P only** → Noise_XX (simpler, no server)
-- **Async P2P + forward secrecy** → Signal (X3DH + Double Ratchet), minimal prekey server
-- **Federated group chat** → Matrix (Olm = Double Ratchet, Megolm = sender-key for groups)
-- **All three** → Wire protocol (open source, uses Proteus which is Signal-derived)
-
-**TODO: Decide which profile(s) the skeleton should pre-build**
+```kotlin
+P2PSession(
+    discovery  = NostrDiscovery(relayUrl, topic = watchRoomId),
+    signaling  = NostrSignaling(relayUrl),
+    transport  = WebRtcTransport(stunServers),
+    framing    = LengthPrefixFraming(),
+    cipher     = NoopCipher(),   // DTLS-SRTP already encrypts WebRTC DataChannel
+)
+```
 
 ---
 
-## 5. Blockchain — What Is Actually Feasible on Mobile
+## 6. Peer Discovery and Signaling
 
-Not trying to run a node. Feasible = read/write chain state, sign transactions, verify proofs.
+**DECIDED: mDNS for LAN, Nostr for internet. No TURN. No Cloudflare Workers.**
 
-### What works well
+### LAN: mDNS (NsdManager)
 
-**Wallet (key management)**
-Generate BIP39 mnemonic → BIP32 HD derivation → Ethereum or Bitcoin addresses. Sign transactions
-locally. Library: `web3j` (Ethereum), `bitcoinj` (Bitcoin). Zero network required for key ops.
+`NsdDiscovery` advertises `_<serviceType>._tcp.local` and listens for the same. Peers on the same
+WiFi appear in `peers: Flow<PeerInfo>` with their local IP and port. Direct TCP connection follows
+— no signaling needed.
 
-**Read chain state via RPC**
-`eth_call`, `eth_getBalance`, `eth_getLogs` via JSON-RPC to a public endpoint (Infura, Alchemy,
-public RPCs). Polling or WebSocket subscription for events. Useful for: check if address holds a
-token, read contract state, verify payment received.
+Android's `NsdManager` has subtle threading requirements: registration and unregistration must
+happen on the same thread, and callbacks are delivered on an internal thread. `NsdDiscovery`
+encapsulates this correctly. Opencode does not touch it.
 
-**IPFS / content-addressed storage**
-Store app data (profiles, messages, files) on IPFS. Addressed by content hash (CID), not location.
-Library: `java-ipfs-http-client` — talks to an IPFS node (local Kubo instance or a pinning service
-like Pinata/Web3.Storage). Useful for: decentralised profile pictures, file sharing in P2P apps,
-immutable published content.
+### Internet: Nostr + WebRTC + STUN
 
-**Decentralised Identity (DID)**
-`did:ethr` or `did:key` — a public key IS your identity. No username, no server. Verify someone's
-identity by checking their DID document on-chain or via a well-known resolution endpoint. Combines
-well with the Signal IdentityStore — the Signal identity key IS the DID key.
+**Nostr** is a decentralised relay protocol. Any Nostr relay (dozens exist, free, no account
+required) can relay signed JSON events. The app generates an Ed25519 keypair on install — that IS
+the Nostr identity. No signup.
 
-**NFT / token gating**
-Check `balanceOf(address)` on an ERC-20/ERC-721 contract. Simple `eth_call`. Could gate app
-features (e.g., group chat room access requires holding a specific token). 
+Signaling flow:
+```
+Alice                        Nostr Relay                     Bob
+  |-- publish SDP offer -------->|                             |
+  |   (event kind=25000,         |                             |
+  |    to=bob's pubkey,          |-- relay to bob's sub ------>|
+  |    encrypted with bob's key) |                             |
+  |                              |<-- SDP answer + ICE --------|
+  |<-- relay to alice's sub -----|                             |
+  |                              |                             |
+  |<======= WebRTC DataChannel (DTLS-SRTP) ===================>|
+  |             (Nostr relay is done, no longer involved)      |
+```
 
-**Payment channels / state channels**
-Pre-fund a channel on-chain, exchange signed state updates off-chain, settle on-chain later.
-Bitcoin Lightning Network is the most mature. Ethereum has Connext, Raiden. Complex to implement
-but enables microtransactions without per-transaction gas fees. Realistic use: pay-per-use features
-in a P2P app.
+Once WebRTC connects, the Nostr relay is no longer in the path. It only brokered the handshake.
 
-**Signing messages / proofs**
-Sign arbitrary data with an Ethereum private key (`eth_sign`). Prove identity or intent without an
-on-chain transaction. Verify signature in Kotlin with `web3j`. Useful for: "prove you own this
-address", challenges/responses in auth flows.
+**STUN**: `stun:stun.l.google.com:19302` (free, no account). Discovers public IP for ICE candidates.
 
-### What is NOT feasible
+**No TURN**: symmetric NAT users (~20%) cannot connect. Acceptable tradeoff — no relay server cost
+or infrastructure to maintain.
 
-- Running a full node (100GB+ storage)
-- Real-time on-chain events (12s block time on Ethereum mainnet, finality is longer)
-- Mining
-- Complex ZK proof generation on-device (verification is fine, generation is too slow)
+### Why Nostr works for this
 
-### Most useful patterns for this app factory
-
-1. **DID as identity** in P2P chat — no username server, verify via public key
-2. **IPFS for content** — share files P2P without a server, persist group chat media
-3. **Read-only RPC** — check token balances, verify payments
-4. **Signed messages** — lightweight auth without a backend
-
-**TODO: Which of these to include in the skeleton's crypto/ or a new web3/ package?**
+- No account — app generates keypair, that's the identity
+- Multiple public relays — app tries several, no single point of failure
+- Messages are signed by sender's keypair — the SDP offer is verifiable
+- The same keypair can be the app's cryptographic identity (IIdentity) — one key for everything
 
 ---
 
-## 6. Maps, Travel Apps, Real-time Location
+## 7. Crypto
+
+**DECIDED: Noise_XX for synchronous P2P (online both sides). Signal/X3DH documented but not
+pre-built — add per-app when async offline messaging is required.**
+
+### What's in the skeleton
+
+**`AesGcmCipher`** — stateless. Takes a symmetric key, encrypts each frame with a random 12-byte
+nonce prepended to the ciphertext. No state to manage. Use when the key is established out-of-band
+(group pre-shared key, or derived from a Noise handshake).
+
+**`NoiseCipher`** — stateful. Implements `ICipher` but internally runs a Noise_XX handshake on
+first use, then uses the resulting session keys for all subsequent encrypt/decrypt calls. The
+handshake is transparent to `P2PSession` — it just calls `encrypt`/`decrypt`.
+
+**`Ed25519Identity`** — generates an Ed25519 keypair on first run, persists it to the app's private
+files directory. Same keypair is used as Nostr identity (for signaling) and as the Noise static key
+(for session encryption). One key, two roles.
+
+**`NoopCipher`** — identity cipher. WebRTC's DataChannel is already encrypted with DTLS-SRTP.
+Encrypting again wastes CPU. `NoopCipher` satisfies `ICipher` without doing anything.
+
+### Noise_XX explained briefly
+
+Three-message handshake. Both sides start knowing only their own static keypair.
+
+```
+Alice → Bob:  E_alice (ephemeral public key, cleartext)
+Bob → Alice:  E_bob + encrypt(S_bob)   // Bob's static key, encrypted under DH(e_bob, E_alice)
+Alice → Bob:  encrypt(S_alice)         // Alice's static key, encrypted under accumulated DH state
+--- handshake complete ---
+Both sides derive two symmetric keys (one per direction) from the accumulated DH outputs.
+```
+
+Result: mutual authentication, forward secrecy (ephemeral keys discarded after handshake), identity
+hiding from passive observers.
+
+What it does NOT provide: per-message forward secrecy (that's the Double Ratchet), offline
+messaging (that's X3DH + prekeys).
+
+### Signal / Double Ratchet (documented, not pre-built)
+
+See `docs/crypto.md` for full explanation. Summary of when you need it:
+
+- **Both online**: Noise_XX is sufficient and simpler.
+- **Offline messaging**: need X3DH + prekeys. Prekeys must be stored somewhere Bob's peers can
+  fetch them. Options (in order of decentralisation):
+  1. Nostr event — Bob publishes a signed prekey bundle as a Nostr event. Alice fetches it.
+     No server. One-time prekeys aren't truly single-use (anyone can fetch the same event) but
+     signed prekeys rotate weekly. Acceptable for personal apps.
+  2. Self-hosted endpoint — a single static file server (nginx, GitHub Pages) serving Bob's
+     current signed prekey JSON. Bob rotates it periodically. Stateless, no compute.
+  3. Per-app decision — skeleton documents the interface, implementation chosen per app.
+
+### Key hierarchy
+
+```
+Ed25519 keypair (IIdentity)
+  ├── Nostr identity (pubkey = Nostr npub, signs relay events)
+  ├── Noise static key (used in Noise_XX handshake)
+  └── DID key (did:key:z... — the public key IS the decentralised identity)
+```
+
+One keypair. Three uses. No separate key management per protocol.
+
+---
+
+## 8. NetworkService — Composition not Inheritance
+
+`NetworkService` is a foreground Android `Service` that manages lifecycle. It does not know what
+work it's doing. Work is injected as a `ServiceWorker`.
+
+```kotlin
+fun interface ServiceWorker {
+    suspend fun run(scope: CoroutineScope)
+}
+
+class NetworkService : Service() {
+    private var worker: ServiceWorker? = null
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    fun attach(worker: ServiceWorker) { this.worker = worker }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        startForeground(NOTIF_ID, buildNotification())
+        scope.launch { worker?.run(this) }
+        return START_STICKY
+    }
+
+    override fun onDestroy() { scope.cancel() }
+    override fun onBind(intent: Intent?) = binder
+}
+```
+
+Usage:
+```kotlin
+// BLE tracking
+service.attach(ServiceWorker { scope ->
+    bleHelper.connect(address, scope)
+    bleHelper.notifications.collect { frame -> process(frame) }
+})
+
+// TCP server
+service.attach(ServiceWorker { scope ->
+    tcpServer.accept(port, scope).collect { conn -> handleConnection(conn) }
+})
+```
+
+No subclassing. `NetworkService` never changes when new service types are added.
+
+---
+
+## 9. Protocols
+
+**DECIDED: WebRTC (STUN only, no TURN) for internet P2P. mDNS + direct TCP for LAN.**
+
+| Use case | Protocol | Notes |
+|---|---|---|
+| LAN discovery | mDNS (NsdManager) | Built-in, no deps |
+| Internet peer discovery + signaling | Nostr relay | No account, decentralised |
+| LAN data (tracker, co-watch) | TCP via TcpTransport | Simple, reliable |
+| Internet P2P (chat, co-watch) | WebRTC DataChannel | STUN NAT traversal, DTLS encrypted |
+| Video/audio call | WebRTC MediaStream | Same transport, add media tracks |
+| REST APIs (flights, weather, OSM) | HTTP/2 (OkHttp) | Standard |
+| Real-time location (server-based) | MQTT | QoS 1, pub-sub, tiny overhead |
+| BLE peripheral | GATT via BLEHelper | From wristturn-app |
+
+### WebRTC library
+
+`io.getstream:webrtc-android` (~20MB AAR). Documented in `docs/optional-deps.md`. Not in skeleton's
+`build.gradle` — only apps that need P2P or video add it.
+
+### QUIC
+
+Documented in `docs/optional-deps.md`. Android's Cronet supports it. Useful for file transfer over
+mobile where connection migration (WiFi → LTE) matters. Not in skeleton.
+
+---
+
+## 10. Maps and Location
 
 ### Map rendering
 
-**MapLibre Android** — vector tile renderer, open source (MapLibre GL JS fork), MIT license.
-Renders Mapbox-compatible style JSON. Supports offline regions (download tiles for a bounding box).
+**MapLibre Android** — vector tiles, offline capable, open source. Not in skeleton `build.gradle`
+(adds ~10MB). Documented in `docs/optional-deps.md` with ready-made `libs.versions.toml` entry.
 
-**Tile sources**
-- OpenStreetMap raster tiles: free, rate-limited, raster (not ideal for custom styles)
-- OpenMapTiles (vector): self-hostable, or use free tiers (Maptiler free tier = 100k req/month)
-- Protomaps: single `.pmtiles` file containing entire world vector data. Download once, read locally.
-  **Best option for fully offline maps.** File size: ~100MB (planet), downloadable by region.
+**Greyscale style** — pre-built as `assets/styles/greyscale.json`. Every map app gets this for
+free even if MapLibre isn't in the skeleton. The style JSON is just a text file.
 
-**Styles**
-- Default OSM style: cluttered, not designed for mobile
-- Good defaults: MapLibre's `demotiles`, Maptiler's `Basic` style
-- **Greyscale/low-power style**: a simple style JSON that turns off satellite imagery, uses grey for
-  land, black/white for roads and labels. Vector tiles → renders at any zoom without pixelation.
-  Pre-build this in the skeleton as `assets/styles/greyscale.json`.
+**Offline tiles** — Protomaps `.pmtiles` format. Single file per region, downloaded once.
+Pattern documented in `docs/maps.md`.
 
-**Custom style for low-power mode**
+### Routing and travel data
+
+See `docs/maps.md`. Summary:
+
+| Data | Source | Notes |
+|---|---|---|
+| Geocoding | Nominatim (OSM) | Free, self-hostable |
+| Routing | OSRM public API | Rate-limited, self-hostable |
+| POI search | Overpass API | Full OSM query language |
+| Flights (live positions) | OpenSky Network | Free ADS-B |
+| Flights (search/pricing) | Amadeus API | Free sandbox 2000 req/month |
+| Transit schedules | GTFS feeds | Every major agency publishes these |
+| Transit real-time | GTFS-RT | Protobuf, vehicle positions + delays |
+| Weather | Open-Meteo | Completely free, no API key |
+
+### Group location sharing
+
+Binary message format (32 bytes/update):
+```
+userId (4) | lat (8) | lng (8) | accuracy (4) | timestamp (8) | [encrypted with group AES key]
+```
+
+Transport: on LAN use `TcpTransport` + `NsdDiscovery`. Over internet use MQTT (broker-based,
+everyone subscribes to `trips/<roomId>/locations/#`) or WebRTC mesh.
+
+Location data is always E2E encrypted with `AesGcmCipher` before sending. Server/broker sees only
+ciphertext.
+
+---
+
+## 11. Co-watching Video
+
+**Components**
+
+- Player: `androidx.media3:media3-exoplayer`
+- Sync channel: `WebRtcTransport` DataChannel (reliable, ordered) for P2P, or WebSocket to a
+  relay for server-based
+- Chat: second DataChannel or same channel with message type tag
+- Encryption: `NoopCipher` (WebRTC DataChannel is DTLS-SRTP encrypted)
+
+**Sync protocol**
+
+Leader (room creator) broadcasts at 1Hz:
 ```json
-{ "layers": [
-  { "id": "background", "type": "background", "paint": { "background-color": "#e8e8e8" }},
-  { "id": "roads", "type": "line", "source-layer": "transportation",
-    "paint": { "line-color": "#888", "line-width": ["interpolate", ["linear"], ["zoom"], 10, 1, 16, 4] }},
-  { "id": "labels", "type": "symbol", "source-layer": "place",
-    "layout": { "text-field": "{name}" }, "paint": { "text-color": "#111" }}
-]}
+{ "type": "sync", "pos": 142.3, "playing": true, "at": 1721234567890 }
 ```
 
-### Routing
-
-- **OSRM** (Open Source Routing Machine): HTTP API, self-hostable. Fastest for car routing.
-- **Valhalla**: multi-modal (car, bike, foot, transit), self-hostable. Slightly slower but more
-  capable. Used by OpenTripPlanner.
-- **GraphHopper**: Java, embeddable in Android. Can run on-device for a region. ~50MB per region.
-- **Public APIs**: Project OSRM demo server (rate-limited), Geoapify (generous free tier).
-
-For travel apps: use public APIs first, self-host if needed.
-
-### Travel data
-
-**Flights**
-- Amadeus API (free sandbox: 2000 req/month, flight search, pricing)
-- Duffel API (developer-friendly, real airline content)
-- Skyscanner: no public API (scraped → fragile, against ToS)
-- OpenSky Network: real-time ADS-B flight positions, free
-
-**Transit**
-- GTFS: standard format for transit schedules. Every major transit agency publishes this.
-- GTFS-RT: real-time updates (vehicle positions, delays, alerts) via Protocol Buffers.
-- OpenTripPlanner: open source multimodal router, consumes GTFS + OSM.
-- TransitLand: aggregated GTFS feeds for global transit.
-
-**Points of Interest**
-- Overpass API: query OSM data (`amenity=restaurant within 500m of lat/lon`). Powerful.
-- Nominatim: OSM geocoding (address → coordinates, coordinates → address). Self-hostable.
-
-**Weather**
-- Open-Meteo: completely free, no API key, hourly forecasts globally. Best option.
-- OpenWeatherMap: free tier 1000 req/day.
-
-### Group trip tracker (real-time location sharing)
-
-**Transport options** (see Section 7 for detailed protocol comparison):
-- **MQTT** over WebSocket: purpose-built for real-time sensor data, tiny protocol, QoS levels.
-  Best fit for location sharing. Broker: HiveMQ Cloud free tier, or self-hosted Mosquitto.
-- **WebSocket** to a simple relay: each user connects, server broadcasts positions to room members.
-  Simplest to implement, needs a server.
-- **WebRTC DataChannel**: fully P2P, no relay needed once connected. NAT traversal via STUN.
-  Harder to set up but no server cost.
-
-**Message format** (compact, binary):
+Follower applies:
 ```
-userId (4 bytes) | lat (8 bytes double) | lng (8 bytes double) | accuracy (4 bytes float) | timestamp (8 bytes long)
-= 32 bytes per update
+target = sync.pos + (localNow - sync.at) / 1000.0
+if |current - target| > 0.5s → seek(target)
+else if drift > 0.1s → setPlaybackSpeed(1.02)  // catch up imperceptibly
 ```
-At 1 update/second per user, 10 users = 320 bytes/second. Tiny.
 
-**Map rendering**: MapLibre with `GeoJsonSource` updated on each position update. Each user is a
-feature in a `FeatureCollection`. Smooth interpolation between positions via `ValueAnimator`.
+Clock offset computed at session start via 4-round-trip NTP exchange (±20ms on LAN, ±100ms internet).
 
-**Privacy**: location data should be E2E encrypted. Group shared key (derived from group DH or
-pre-shared) encrypts each position update before sending. Server/broker sees only ciphertext.
-
-### Real-time maps app in low-power greyscale mode
-
-Architecture:
-- MapLibre with greyscale style JSON
-- `Protomaps .pmtiles` for offline vector tiles (download once per region)
-- Location tracking via `FusedLocationProviderClient` as `Flow<Location>`
-- Optional: contour lines from SRTM elevation data (available as OSM layer)
-
-Greyscale mode is particularly good for e-paper-like scenarios (hiking, long battery life) and
-for data density (greyscale reduces visual noise, lets POI labels stand out).
+**Share target**: app appears in Android share sheet for `video/*` and `application/x-mpegurl` (HLS
+playlists). `IntentHelper` extracts the URI and hands it to the player.
 
 ---
 
-## 7. Protocols Beyond TCP
-
-### WebSocket
-TCP with HTTP upgrade, message framing, works through firewalls and corporate proxies. Text or
-binary frames. OkHttp has a mature WebSocket client.
-
-**Use when**: web compatibility matters, server is HTTP-based, firewall traversal needed.
-
-### WebRTC
-Peer-to-peer with NAT traversal via STUN/TURN. Three sub-protocols:
-- `RTCDataChannel`: reliable or unreliable P2P data (like TCP or UDP semantics, your choice)
-- `MediaStream`: audio/video tracks
-- All traffic is DTLS-SRTP encrypted by default
-
-Requires a **signaling server** (any WebSocket server to exchange SDP/ICE candidates — ~50 lines
-of server code). STUN is free (Google's `stun.l.google.com:19302`). TURN (relay for symmetric NAT)
-needs a server but only used as fallback.
-
-Library: `io.getstream:webrtc-android` (~20MB AAR, easier than raw `libwebrtc`).
-
-**Use when**: P2P video/audio, co-watching, collaborative editing, games. NAT traversal without
-a relay server.
-
-### QUIC
-UDP-based transport protocol. TLS 1.3 built in. Multiplexed streams without head-of-line blocking.
-0-RTT reconnection (important for mobile where network changes constantly: WiFi → LTE → WiFi).
-HTTP/3 uses QUIC.
-
-Android has **Cronet** (Chromium's network stack) which supports QUIC. Also `OkHttp` 5 will support
-QUIC via `conscrypt`.
-
-**Use when**: file transfers over mobile, high-latency connections, many parallel streams.
-Not yet the default for custom protocols but growing.
-
-### MQTT
-Publish-subscribe. Broker-based. 2-byte fixed header. Three QoS levels:
-- QoS 0: fire-and-forget (UDP-like, fastest)
-- QoS 1: at-least-once delivery
-- QoS 2: exactly-once (slowest, rarely needed)
-
-Topic hierarchy: `trips/abc123/users/alice/location`, subscribe to `trips/abc123/#` to get all
-users' positions. Broker: HiveMQ Cloud (free 100 connections), Eclipse Mosquitto (self-hosted, 1MB).
-
-Library: `org.eclipse.paho:org.eclipse.paho.client.mqttv3`
-
-**Use when**: location sharing, IoT-style sensor data, group state sync, anything pub-sub.
-
-### Matrix Protocol
-Federated, room-based, E2E encrypted (Olm = Double Ratchet per-user, Megolm = sender-key for rooms).
-Can self-host a homeserver (Synapse, Conduit). Rooms are permanent and federated across servers.
-SDK: `matrix-android-sdk2`.
-
-**Use when**: group chat with federation, persistent rooms, decentralised community. Matrix solves
-the server discovery problem for P2P chat by federating homeservers rather than going fully P2P.
-
-### Protocol selection matrix
-
-| Use case | Protocol |
-|---|---|
-| Location sharing, group state | MQTT |
-| P2P chat (online, no server) | WebRTC DataChannel + Noise_XX |
-| P2P chat (async, offline) | Matrix (Olm/Megolm) or Signal |
-| Video call | WebRTC MediaStream |
-| Co-watch sync events | WebSocket or WebRTC DataChannel |
-| File transfer, mobile resilience | QUIC (Cronet) |
-| REST API calls | HTTP/2 (OkHttp default) |
-| Local network discovery | mDNS (NsdManager) |
-| BLE peripherals | GATT (BLEHelper) |
-
----
-
-## 8. Co-watching Video (Synchronized Playback)
-
-Watch the same video with multiple users, chat on the side, stay in sync.
-
-### Components
-
-**Video player**: `androidx.media3:media3-exoplayer` (modern ExoPlayer). Supports HLS, DASH, MP4,
-local files, HTTP streams.
-
-**Sync channel**: WebSocket (if server exists) or WebRTC DataChannel (fully P2P).
-
-**Chat**: same DataChannel or a separate reliable DataChannel.
-
-### Sync protocol
-
-Leader election: simplest = room creator is leader. Leader broadcasts:
-
-```json
-{ "type": "sync", "position": 142.3, "playing": true, "at": 1721234567890 }
-```
-
-Followers receive and apply:
-```
-targetPosition = sync.position + (localNow - sync.at) / 1000.0 * playbackRate
-seek if |currentPosition - targetPosition| > DRIFT_THRESHOLD (0.5s)
-```
-
-This compensates for network latency. `sync.at` is the leader's wall clock when the event was
-sent. Followers compute how far playback should have advanced since then.
-
-**Clock sync**: wall clocks differ between devices. Run a brief NTP-style exchange at session start
-(4 round-trips, compute offset and delay). Achievable accuracy: ±20ms on LAN, ±100ms over internet.
-
-### Content sources
-
-- **HLS/DASH stream**: everyone pulls from the same URL. Buffering is independent but position is
-  synced. Best option for internet streams.
-- **Local file**: all users must have the same file. Transfer via WebRTC DataChannel or IPFS CID.
-- **YouTube/other**: DRM-protected content cannot be controlled via ExoPlayer. Use `WebView` with
-  JS injection to control playback (fragile, works for YouTube embeds).
-
-### Drift handling
-
-Users on slow connections buffer differently. Options:
-- Pause all: when any user buffers, leader pauses and waits. Simple, annoying.
-- Speed adjustment: ExoPlayer supports `setPlaybackSpeed(1.02f)` to slowly catch up. Imperceptible.
-- Tolerance window: only resync when drift > 2s. Ignore small differences.
-
-### Architecture
-
-```
-P2PSession (WebRTC)
-  ├── DataChannel "sync" (reliable, ordered) — play/pause/seek events
-  ├── DataChannel "chat" (reliable, ordered) — chat messages
-  └── optional: MediaStream (if screen sharing rather than content sync)
-
-SyncController
-  ├── ExoPlayer instance
-  ├── ClockSync (NTP-style offset computation)
-  └── DriftMonitor (periodic position comparison, emit resync when needed)
-
-ChatOverlay
-  └── LazyColumn of messages, input field
-```
-
----
-
-## 9. Android Share Target
-
-Two directions:
+## 12. Android Share Target
 
 ### Receiving (appear in share sheet)
 
-App appears in Android's "Share to" dialog when another app shares files/text.
+`IntentHelper.kt` handles `ACTION_SEND` and `ACTION_SEND_MULTIPLE`. Reads URIs, copies them to
+app cache via `UriHelper`, then hands to the app's processing flow.
 
-Manifest:
+Manifest intent filters are commented out by default. Opencode uncomments the MIME types needed:
+
 ```xml
-<activity android:name=".MainActivity">
-  <intent-filter>
-    <action android:name="android.intent.action.SEND" />
-    <category android:name="android.intent.category.DEFAULT" />
-    <data android:mimeType="image/*" />
-  </intent-filter>
-  <intent-filter>
-    <action android:name="android.intent.action.SEND_MULTIPLE" />
-    <category android:name="android.intent.category.DEFAULT" />
-    <data android:mimeType="image/*" />
-  </intent-filter>
-  <!-- Add more MIME types as needed: application/pdf, video/*, */* -->
-</activity>
+<!-- Uncomment for image sharing: -->
+<!-- <data android:mimeType="image/*" /> -->
+<!-- Uncomment for video: -->
+<!-- <data android:mimeType="video/*" /> -->
+<!-- Uncomment for any file: -->
+<!-- <data android:mimeType="*/*" /> -->
 ```
 
-Skeleton provides `IntentHelper.kt` — reads `ACTION_SEND`/`ACTION_SEND_MULTIPLE` from intent, extracts
-URIs, hands them to `UriHelper.copyToCache()`. Opencode uncomments the MIME types it needs.
+### Direct Share shortcuts
 
-### Direct Share (shortcuts in share sheet)
-
-Show specific contacts/rooms as top-level targets in the share sheet.
-
-`ShortcutManager.setDynamicShortcuts()` — Android 7.1+. Each shortcut is a `ShortcutInfo` with
-a `category` matching `android.intent.category.BROWSABLE`. The system exposes these as Direct Share
-targets. Update shortcuts when the user's contacts/rooms change.
-
-### Sending (put content on the share sheet)
-
-Already covered by `ShareHelper.shareFile()` in Tier 1. Uses `FileProvider` + `ShareCompat`.
+`ShortcutManager.setDynamicShortcuts()` exposes contacts/rooms as top-level share targets. Update
+shortcuts when contacts change. Pattern documented in `docs/share-targets.md`.
 
 ---
 
-## 10. Open Questions / Decisions
+## 13. Blockchain
 
-1. **Signal vs Noise vs Matrix** — which protocol profile to pre-build in `crypto/`?
-   - Noise_XX: simplest, online-only P2P. No prekey server.
-   - Signal: async P2P, needs minimal prekey server. Where does that server live?
-   - Matrix: self-hosted Synapse. More infrastructure but federation is solved.
+**DECIDED: Tier 5 (documented only). Too app-specific for skeleton.**
 
-2. **Blockchain scope** — which tier?
-   - Tier 2 (in skeleton network/): DID + IPFS client
-   - Tier 5 (docs only): `web3j` for Ethereum, `bitcoinj` for Bitcoin
-   - Probably Tier 5 — too app-specific for skeleton
+What is feasible on mobile (no node, no mining):
 
-3. **MapLibre in skeleton** — include `maps/` Tier 4 by default, or docs-only?
-   - MapLibre AAR is ~10MB. Not every app needs it.
-   - Probably Tier 5 with a ready-made `libs.versions.toml` entry and style JSON in `assets/`.
+| Capability | Library | Notes |
+|---|---|---|
+| Wallet keygen + signing | `web3j` | BIP39 mnemonic → HD derivation → address |
+| Read chain state | `web3j` JSON-RPC | `eth_call`, `eth_getBalance` via public RPC |
+| IPFS content | `java-ipfs-http-client` | Store/fetch by CID, pin via Pinata |
+| DID identity | `did:key` (no lib needed) | Ed25519 pubkey → `did:key:z...` |
+| Signed messages | `web3j` | Prove ownership without on-chain tx |
 
-4. **Which prekey server for async Signal?**
-   - Cloudflare Worker (free, stateless, ~20 lines of JS)
-   - IPFS (no server, but eventual consistency — prekey may not be latest)
-   - Decide per-app. Skeleton documents the interface, not the implementation.
+**DID alignment**: The `Ed25519Identity` keypair in the skeleton is the same keypair that becomes
+`did:key:z<base58-encoded-pubkey>`. No extra library. The skeleton's identity layer is DID-ready
+by design.
 
-5. **WebRTC library**: `io.getstream:webrtc-android` (~20MB) or roll with raw DTLS over UDP?
-   - Stream's library is the pragmatic choice. Document as optional dep.
-
-6. **MQTT broker for location sharing**: HiveMQ Cloud free tier vs self-hosted Mosquitto?
-   - HiveMQ for quick starts. Mosquitto for production. Document both.
-
-7. **Protomaps .pmtiles for offline**: in skeleton or per-app download?
-   - Per-app — file size is region-dependent. Skeleton documents the download pattern.
+See `docs/blockchain.md` for full analysis including payment channels and ZK proof verification.
 
 ---
 
-## 11. CI / Release
+## 14. Optional Deps Reference
 
-### build.yml triggers
-- `push` to `skeleton` → run tests only (no APK artifact — skeleton is not an installable app)
-- `push` to `app/**` → test + `assembleRelease` + upload artifact
+All in `docs/optional-deps.md`. Copy-paste blocks including ProGuard rules.
 
-### release.yml (manual only)
-```yaml
-on:
-  workflow_dispatch:
-    inputs:
-      branch:
-        description: 'Branch to release (e.g. app/img-to-pdf)'
-        required: true
-      tag:
-        description: 'Release tag (e.g. v1.0.0)'
-        required: true
-        default: 'v1.0.0'
-```
-Downloads the latest successful artifact from `branch`'s last build run, publishes GitHub Release.
-No rebuild — releases the already-tested artifact.
-
-### ABI targets
-`arm64-v8a,armeabi-v7a` — covers ~99% of physical Android devices. Excludes `x86`/`x86_64` (emulator
-only). For apps with FFmpeg or AI models: consider `arm64-v8a` only to halve APK size.
+| Dep | Size | When |
+|---|---|---|
+| `io.getstream:webrtc-android` | ~20MB | Any P2P / video feature |
+| `ffmpeg-kit-android-min` | ~15MB/ABI | Video/audio processing |
+| `org.tensorflow:tensorflow-lite` | ~1MB + model | On-device vision inference |
+| `com.microsoft.onnxruntime:onnxruntime-android` | ~5MB | General on-device inference |
+| `llama.cpp` (JNI) | varies | On-device LLM (Phi-3, Gemma-2B) |
+| `androidx.room:room-runtime` | ~500KB | SQLite ORM |
+| `org.maplibre.gl:android-sdk` | ~10MB | Vector maps |
+| `noise-java` | ~50KB | Noise_XX if rolling your own |
+| `libsignal-client` | ~5MB | Full X3DH + Double Ratchet |
+| `web3j` | ~3MB | Ethereum wallet/RPC |
+| `org.eclipse.paho.client.mqttv3` | ~200KB | MQTT location sharing |
 
 ---
 
-## 12. SKELETON.md — opencode contract
+## 15. CI / Release
+
+### build.yml
+
+- Push to `skeleton` → tests only (skeleton is not an installable app)
+- Push to `app/**` → tests + `assembleRelease` + upload APK artifact (30-day retention)
+
+### release.yml (manual)
+
+`workflow_dispatch` inputs: `branch` (e.g. `app/img-to-pdf`), `tag` (e.g. `v1.0.0`).
+Checks out that branch, rebuilds clean, runs tests, publishes GitHub Release tagged
+`{branch}-{tag}` (e.g. `app/img-to-pdf-v1.0.0`).
+
+---
+
+## 16. SKELETON.md — opencode contract
 
 ```markdown
 ## Pre-built — use these, do not regenerate
-- AppSettings.getString/setString/getBoolean/setBoolean/getInt/setInt
+
+### Core
+- AppSettings — SharedPreferences singleton, already init'd in App.kt
 - PermissionHelper(activity).request(permission, onGranted, onDenied)
 - PermissionHelper(activity).requestMultiple(permissions, onAllGranted, onDenied)
 - UriHelper.copyToCache(context, uri): File
 - ShareHelper.shareFile(context, file, mimeType)
-- BaseViewModel<S> — extend this, call emit(AppState.Success(data))
+- IntentHelper.handleShareIntent(intent): List<Uri>
+- BaseViewModel<S> — extend, call emit(AppState.Success(data))
 - AppTheme { } — wrap top-level Composable
-- AppScaffold(title, actions) { content } — TopAppBar + LoadingOverlay
-- NotificationHelper.createChannels(context) — already called from App.kt
-- CrashLogger.init(context) — already called from App.kt
-- BaseWorker — extend CoroutineWorker, report progress via StateFlow
-- network/NsdHelper — advertise(serviceType, port) / discover(serviceType, onFound)
-- network/TcpServer / TcpClient — framed ByteArray Flow
-- network/SecureChannel — TOFU TLS, persistent RSA identity
-- network/WebSocketTransport — OkHttp WebSocket as ITransport
-- network/NetworkService — foreground service base, extend for long-running network ops
-- ble/BLEHelper — scan/connect/notify lifecycle
-- crypto/CryptoHelper — AES-256-GCM encrypt/decrypt, HKDF
-- crypto/IdentityStore — persist/load key pairs
+- AppScaffold(title, actions) { content }
+- NotificationHelper.createChannels(context) — called from App.kt
+- CrashLogger.init(context) — called from App.kt
+- BaseWorker — extend CoroutineWorker, report via StateFlow
+
+### Network interfaces (compose these, never instantiate directly in business logic)
+- IDiscovery, ISignaling, ITransport, IFraming, ICipher, IIdentity
+
+### Network implementations
+- NsdDiscovery(context, serviceType) — mDNS, LAN
+- NostrDiscovery(relayUrl, topic) — internet via Nostr relay
+- NostrSignaling(relayUrl) — WebRTC SDP/ICE exchange via Nostr
+- DirectSignaling() — offline, QR/clipboard
+- TcpTransport() — direct TCP
+- WebSocketTransport(url) — OkHttp WebSocket
+- WebRtcTransport(stunServers) — P2P with NAT traversal (needs webrtc-android dep)
+- LengthPrefixFraming() — 4-byte length header framing
+- AesGcmCipher(key) — stateless AES-256-GCM
+- NoiseCipher(identity) — Noise_XX stateful handshake
+- NoopCipher() — no-op, for WebRTC (already encrypted)
+- Ed25519Identity(filesDir) — persistent keypair, also Nostr identity + DID key
+
+### Session
+- P2PSession(discovery, signaling, transport, framing, cipher) — wire these together here only
+
+### Service
+- NetworkService — foreground service, call service.attach(ServiceWorker { scope -> ... })
+
+### BLE
+- BLEHelper — scan/connect/notify lifecycle
+
+### Location
+- LocationHelper(context).locations: Flow<Location>
 
 ## You fill in
-1. bash scripts/rename-package.sh com.forge.APPNAME AppName
+1. scripts/rename-package.sh com.forge.APPNAME AppName
 2. res/values/strings.xml: app_name
-3. AndroidManifest.xml: uncomment needed permissions and intent-filters
-4. MainScreen.kt: your UI Composable
-5. MainViewModel.kt: extend BaseViewModel<YourState>, implement business logic
-6. libs.versions.toml + build.gradle: add app-specific deps (see docs/optional-deps.md)
+3. AndroidManifest.xml: uncomment permissions + intent-filters
+4. MainScreen.kt: your Composable
+5. MainViewModel.kt: extend BaseViewModel<YourState>
+6. libs.versions.toml + build.gradle: add app-specific deps (docs/optional-deps.md)
+7. Compose P2PSession in your ViewModel or use-case layer — not in MainActivity
 
 ## Do not touch
-- All files in base/, permission/, file/, notification/, crash/, network/, ble/, crypto/
-- FileProvider configuration (authority = com.forge.APPNAME.fileprovider)
+- network/interfaces/ — never modify existing interfaces, add new ones if needed
+- network/discovery/, network/signaling/, network/transport/, network/framing/
+- crypto/, ble/, permission/, file/, notification/, crash/
+- FileProvider config (authority = com.forge.APPNAME.fileprovider)
 - build.yml / release.yml
 ```
