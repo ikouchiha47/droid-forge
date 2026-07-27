@@ -58,4 +58,4 @@ jobs:
         with:
           name: ${{ github.ref_name }}-release
           path: android/app/build/outputs/apk/release/app-release.apk
-          retention-days: 30
+          retention-days: 90
