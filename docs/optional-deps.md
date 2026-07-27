@@ -121,6 +121,35 @@ Never call DAO on the main thread.
 -keep @androidx.room.Entity class *
 ```
 
+### WAL mode + tuning (always add this)
+
+Based on BigBinary's SQLite tuning recommendations. Apply in your `RoomDatabase` builder:
+
+```kotlin
+Room.databaseBuilder(context, AppDatabase::class.java, "app.db")
+    .addCallback(object : RoomDatabase.Callback() {
+        override fun onOpen(db: SupportSQLiteDatabase) {
+            db.execSQL("PRAGMA journal_mode = WAL")
+            // fsync only at WAL checkpoint, not every write — safe on crash
+            db.execSQL("PRAGMA synchronous = NORMAL")
+            // 128MB memory-mapped I/O — reads bypass kernel copy
+            db.execSQL("PRAGMA mmap_size = 134217728")
+            // cap WAL file at 64MB before checkpointing
+            db.execSQL("PRAGMA journal_size_limit = 67108864")
+            // 20MB page cache (negative = KB)
+            db.execSQL("PRAGMA cache_size = -20000")
+            // wait up to 5s on a locked db instead of failing immediately
+            db.execSQL("PRAGMA busy_timeout = 5000")
+            // temp tables in memory, not disk
+            db.execSQL("PRAGMA temp_store = MEMORY")
+            db.execSQL("PRAGMA foreign_keys = ON")
+        }
+    })
+    .build()
+```
+
+Put this in a `db/DatabaseModule.kt` — not inline in Application or ViewModel.
+
 ---
 
 ## MapLibre — vector maps

@@ -17,7 +17,9 @@ Do not regenerate, reimport, or rewrite these components.
 | `UriHelper` | `suspend UriHelper.copyToCache(context, uri): File` | SAF URI → File in cache dir |
 | `ShareHelper` | `ShareHelper.shareFile(context, file, mimeType)` | FileProvider-aware share sheet |
 | `IntentHelper` | `IntentHelper.handleShareIntent(intent): List<Uri>` | ACTION_SEND / ACTION_SEND_MULTIPLE |
-| `BaseViewModel<S>` | `emit(AppState.Success(data))` | Extend this, call emit() with your state |
+| `BaseViewModel<S, I>` | `emit(AppState.Success(data))`, `handle(intent: I)` | Extend with your state + intent types |
+| `AppEventBus` | `AppEventBus.emit(event)` / `AppEventBus.events.collect {}` | Typed broadcast bus |
+| `UseCase<In, Out>` | `suspend fun execute(input: In): Result<Out>` | Implement for each orchestrated workflow |
 | `AppTheme` | `AppTheme { }` | Material3 theme, wrap top-level Composable |
 | `AppScaffold` | `AppScaffold(title, actions, showLoading) { content }` | Scaffold + TopAppBar + loading indicator |
 | `NotificationHelper` | `NotificationHelper.createChannels(context)` | Called from App.kt — do not call again |
@@ -142,6 +144,37 @@ The following are frozen. Opencode must not modify them.
 - `crypto/`, `ble/`, `permission/`, `file/`, `notification/`, `crash/`
 - `FileProvider` config (authority = `${applicationId}.fileprovider`)
 - `.github/workflows/build.yml` and `release.yml`
+
+---
+
+## Communication boundaries
+
+| Mechanism | When to use |
+|---|---|
+| `suspend fun` | Caller needs the result before proceeding |
+| `Flow<T>` | Continuous stream — producer runs independently of consumer |
+| `AppEventBus.emit(event)` | Broadcast fact — sender does not know who listens |
+
+Never use `GlobalScope`, `runBlocking` on main thread, or raw callbacks where a coroutine fits.
+
+## Coordination boundaries
+
+| Pattern | When to use |
+|---|---|
+| `UseCase<In, Out>` | Steps have a defined order; failure in one step affects others |
+| `AppEventBus` subscriber | Reaction to a fact, independent of other reactions |
+
+**Rule**: orchestrate the workflow (UseCase), choreograph the side effects (AppEventBus).
+A UseCase emits AppEvents at the end. Subscribers react independently.
+
+## UI contract
+
+- UI reads `state: StateFlow<AppState<S>>` only — never repositories or DAOs directly
+- UI sends `viewModel.handle(intent)` only — no other ViewModel method calls
+- State is immutable — no mutable fields, no side effects in state classes
+- `AppState.Loading` → `AppScaffold(showLoading = true)`, not a local boolean
+
+See `docs/architecture.md` for the full design with examples.
 
 ---
 
